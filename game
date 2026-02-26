@@ -1,0 +1,938 @@
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.SourceDataLine;
+import javax.sound.midi.*;
+
+public class TicTacToeUI extends JFrame {
+    private TicTacToe game;
+    private AnimatedButton[][] buttons;
+    private JLabel statusLabel;
+    private JPanel boardPanel;          // keep reference for background animation
+    private boolean vsComputer = false; // toggle for AI opponent
+    private Timer bgTimer;
+
+    // MIDI sequencer for background music
+    private javax.sound.midi.Sequencer sequencer;
+
+    // helper method to synthesize a tone (simple sine wave) of given frequency/duration
+    private static void playTone(final int hz, final int msecs) {
+        new Thread(() -> {
+            try {
+                float SAMPLE_RATE = 44100;
+                byte[] buf = new byte[1];
+                AudioFormat af = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                SourceDataLine sdl = AudioSystem.getSourceDataLine(af);
+                sdl.open(af);
+                sdl.start();
+
+                int totalSamples = msecs * (int)SAMPLE_RATE / 1000;
+                double durationSec = msecs / 1000.0;
+                // make attack/release a bit longer and use cosine ramps for smoothness
+                double attackSec = Math.min(0.05, durationSec * 0.2);   // up to 50ms or 20%
+                double releaseSec = Math.min(0.1, durationSec * 0.3);   // up to 100ms or 30%
+
+                for (int i = 0; i < totalSamples; i++) {
+                    double t = i / SAMPLE_RATE;
+                    double angle = t * hz * 2.0 * Math.PI;
+
+                    // base exponential decay to keep tone from ringing forever
+                    double envelope = Math.exp(-3.0 * t / durationSec);
+
+                    // smooth cosine attack
+                    if (t < attackSec) {
+                        double x = t / attackSec;
+                        envelope *= 0.5 * (1 - Math.cos(Math.PI * x));
+                    }
+                    // smooth cosine release
+                    if (t > durationSec - releaseSec) {
+                        double x = (durationSec - t) / releaseSec;
+                        envelope *= 0.5 * (1 - Math.cos(Math.PI * x));
+                    }
+
+                    buf[0] = (byte) (Math.sin(angle) * 127 * envelope);
+                    sdl.write(buf, 0, 1);
+                }
+                sdl.drain();
+                sdl.stop();
+                sdl.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    // rich effects for move, win, draw
+    private void playMoveSound() {
+        playTone(440, 150);
+    }
+    private void playWinSound() {
+        playTone(880, 150);
+        playTone(1000, 150);
+    }
+    private void playDrawSound() {
+        playTone(330, 150);
+        playTone(250, 150);
+    }
+
+    // piano-style note with simple harmonic content and ADSR envelope
+    private static void playPianoNote(final int hz, final int msecs) {
+        new Thread(() -> {
+            try {
+                float SAMPLE_RATE = 44100;
+                byte[] buf = new byte[1];
+                AudioFormat af = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                SourceDataLine sdl = AudioSystem.getSourceDataLine(af);
+                sdl.open(af);
+                sdl.start();
+
+                int total = msecs * (int)SAMPLE_RATE / 1000;
+                double duration = msecs / 1000.0;
+                // ADSR parameters
+                double attack = Math.min(0.02, duration * 0.1);
+                double decay = Math.min(0.05, duration * 0.2);
+                double sustainLevel = 0.6;
+                double release = Math.min(0.1, duration * 0.3);
+
+                for (int i = 0; i < total; i++) {
+                    double t = i / SAMPLE_RATE;
+                    double angle = t * hz * 2.0 * Math.PI;
+                    // add a bit of second harmonic for timbre
+                    double signal = Math.sin(angle) + 0.5 * Math.sin(2 * angle);
+
+                    // envelope
+                    double env;
+                    if (t < attack) {
+                        env = (t / attack);
+                    } else if (t < attack + decay) {
+                        env = 1 - (1 - sustainLevel) * ((t - attack) / decay);
+                    } else if (t < duration - release) {
+                        env = sustainLevel;
+                    } else {
+                        env = sustainLevel * ((duration - t) / release);
+                    }
+
+                    buf[0] = (byte) (signal * 127 * env);
+                    sdl.write(buf, 0, 1);
+                }
+                sdl.drain();
+                sdl.stop();
+                sdl.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    public TicTacToeUI() {
+        initUI();
+    }
+
+    // lightweight subclass that can fade in symbols and flash when highlighting
+    private class AnimatedButton extends JButton {
+        private char symbol = '\0';
+        private float alpha = 0f;
+        private float scale = 1f;
+        private float angle = 0f;            // for rotation
+        private Timer fadeTimer;
+        private Timer highlightTimer;
+        private Timer spinTimer;
+        private Color defaultBg;
+        private boolean flashing;
+
+        AnimatedButton() {
+            super(" ");
+            setFont(new Font(Font.SANS_SERIF, Font.BOLD, 60));
+            defaultBg = getBackground();
+        }
+
+        void animateSymbol(char c) {
+            symbol = c;
+            alpha = 0f;
+            scale = 0.5f;
+            angle = - (float)Math.PI / 2;  // start rotated
+            setText(" ");
+            // fade-in, scale-up, and rotate simultaneously
+            fadeTimer = new Timer(30, e -> {
+                alpha += 0.1f;
+                scale += 0.05f;
+                angle += 0.1f;
+                if (alpha >= 1f) {
+                    alpha = 1f;
+                }
+                if (scale >= 1f) {
+                    scale = 1f;
+                }
+                if (angle >= 0f) {
+                    angle = 0f;
+                }
+                if (alpha == 1f && scale == 1f && angle == 0f) {
+                    fadeTimer.stop();
+                    setText(String.valueOf(symbol));
+                }
+                repaint();
+            });
+            fadeTimer.start();
+            playMoveSound();
+        }
+
+        void flash() {
+            if (highlightTimer != null && highlightTimer.isRunning()) return;
+            flashing = true;
+            highlightTimer = new Timer(300, new ActionListener() {
+                private boolean on = false;
+                private int count = 0;
+                public void actionPerformed(ActionEvent e) {
+                    on = !on;
+                    setBackground(on ? Color.YELLOW : defaultBg);
+                    if (++count >= 6) {
+                        highlightTimer.stop();
+                        setBackground(defaultBg);
+                        flashing = false;
+                    }
+                }
+            });
+            highlightTimer.start();
+        }
+
+        void spin() {
+            if (spinTimer != null && spinTimer.isRunning()) return;
+            spinTimer = new Timer(30, e -> {
+                angle += 0.3f;
+                if (angle > 2 * Math.PI) {
+                    angle -= 2 * Math.PI;
+                }
+                repaint();
+            });
+            spinTimer.setRepeats(false);
+            spinTimer.setInitialDelay(0);
+            spinTimer.start();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            if (symbol != '\0' && (alpha < 1f || scale < 1f || angle != 0f)) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+                g2.setFont(getFont());
+                FontMetrics fm = g2.getFontMetrics();
+                String s = String.valueOf(symbol);
+                int sw = fm.stringWidth(s);
+                int sh = fm.getAscent();
+                int x = (getWidth() - sw) / 2;
+                int y = (getHeight() + sh) / 2 - fm.getDescent();
+                // apply rotation and scaling around center
+                int cx = getWidth() / 2;
+                int cy = getHeight() / 2;
+                g2.rotate(angle, cx, cy);
+                g2.translate(cx, cy);
+                g2.scale(scale, scale);
+                g2.translate(-cx, -cy);
+                g2.drawString(s, x, y);
+                g2.dispose();
+            } else {
+                super.paintComponent(g);
+            }
+        }
+    }
+
+    private void initUI() {
+        // try Nimbus look and feel for a modern appearance
+        try {
+            for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels()) {
+                if ("Nimbus".equals(info.getName())) {
+                    UIManager.setLookAndFeel(info.getClassName());
+                    break;
+                }
+            }
+        } catch (Exception ignored) { }
+
+        game = new TicTacToe();
+
+        setTitle("Tic Tac Toe");
+        setLayout(new BorderLayout());
+
+        boardPanel = new JPanel(new GridLayout(3, 3));
+        buttons = new AnimatedButton[3][3];
+        startBackgroundAnimation();
+
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                AnimatedButton btn = new AnimatedButton();
+                final int row = i;
+                final int col = j;
+                btn.addActionListener(e -> handleMove(row, col));
+                buttons[i][j] = btn;
+                boardPanel.add(btn);
+            }
+        }
+
+        add(boardPanel, BorderLayout.CENTER);
+
+        statusLabel = new JLabel("Player X's turn");
+        statusLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        add(statusLabel, BorderLayout.SOUTH);
+
+        JMenuBar menuBar = new JMenuBar();
+        JMenu gameMenu = new JMenu("Game");
+        JMenuItem newItem = new JMenuItem("New");
+        newItem.addActionListener(e -> resetGame());
+        gameMenu.add(newItem);
+        JCheckBoxMenuItem aiToggle = new JCheckBoxMenuItem("Play vs Computer");
+        aiToggle.addActionListener(e -> vsComputer = aiToggle.isSelected());
+        gameMenu.add(aiToggle);
+        menuBar.add(gameMenu);
+        setJMenuBar(menuBar);
+
+        setSize(400, 400);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // ensure music stops when window closes
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                stopBackgroundMusic();
+            }
+        });
+        setLocationRelativeTo(null);
+    }
+
+    private void handleMove(int row, int col) {
+        if (game.isGameOver()) {
+            return;
+        }
+
+        if (!game.makeMove(row, col)) {
+            JOptionPane.showMessageDialog(this, "Invalid move! Try again.");
+            return;
+        }
+
+        buttons[row][col].animateSymbol(game.getBoard()[row][col]);
+
+        if (game.isGameOver()) {
+            statusLabel.setText("Player " + game.getCurrentPlayer() + " has won!");
+            playWinSound();
+            animateStatus();
+            // highlight winning line
+            int[][] line = game.getWinningLine();
+            if (line != null) {
+                for (int[] cell : line) {
+                    AnimatedButton btn = buttons[cell[0]][cell[1]];
+                    btn.flash();
+                    btn.spin();
+                }
+            }
+            int choice = JOptionPane.showOptionDialog(this,
+                    "Player " + game.getCurrentPlayer() + " wins!\nPlay again?",
+                    "Game Over",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    new Object[]{"Yes","No"},
+                    "Yes");
+            if (choice == JOptionPane.YES_OPTION) {
+                resetGame();
+            } else {
+                System.exit(0);
+            }
+        } else if (game.isBoardFull()) {
+            statusLabel.setText("Draw!");
+            playDrawSound();
+            animateStatus();
+            int choice = JOptionPane.showOptionDialog(this,
+                    "It's a draw!\nPlay again?",
+                    "Game Over",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    new Object[]{"Yes","No"},
+                    "Yes");
+            if (choice == JOptionPane.YES_OPTION) {
+                resetGame();
+            } else {
+                System.exit(0);
+            }
+        } else {
+            game.switchPlayer();
+            statusLabel.setText("Player " + game.getCurrentPlayer() + "'s turn");
+            animateStatus();
+            if (vsComputer && game.getCurrentPlayer() == 'O') {
+                computerMove();
+            }
+        }
+    }
+
+    private void animateStatus() {
+        // simple color flash on the label
+        final Color normal = statusLabel.getForeground();
+        Timer t = new Timer(100, new ActionListener() {
+            int count = 0;
+            boolean red = false;
+            public void actionPerformed(ActionEvent e) {
+                statusLabel.setForeground(red ? Color.RED : normal);
+                red = !red;
+                if (++count >= 6) {
+                    ((Timer)e.getSource()).stop();
+                    statusLabel.setForeground(normal);
+                }
+            }
+        });
+        t.start();
+    }
+
+    private void computerMove() {
+        int[] move = game.pickRandomMove();
+        if (move == null) return;
+        // small delay so user sees their mark first
+        Timer t = new Timer(400, e -> {
+            handleMove(move[0], move[1]);
+        });
+        t.setRepeats(false);
+        t.start();
+    }
+
+    private void startBackgroundAnimation() {
+        if (bgTimer != null) return; // already running
+        bgTimer = new Timer(200, new ActionListener() {
+            float hue = 0f;
+            public void actionPerformed(ActionEvent e) {
+                hue += 0.02f;
+                if (hue > 1f) hue = 0f;
+                boardPanel.setBackground(Color.getHSBColor(hue, 0.2f, 1f));
+            }
+        });
+        bgTimer.start();
+        startBackgroundMusic();
+    }
+
+    private void resetGame() {
+        game.reset();
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                buttons[i][j].setText(" ");
+            }
+        }
+        statusLabel.setText("Player " + game.getCurrentPlayer() + "'s turn");
+        if (vsComputer && game.getCurrentPlayer() == 'O') {
+            computerMove();
+        }
+    }
+
+    // start looping MIDI piano background using built-in synthesizer
+    private void startBackgroundMusic() {
+        if (sequencer != null && sequencer.isOpen()) return;
+        try {
+            sequencer = javax.sound.midi.MidiSystem.getSequencer();
+            sequencer.open();
+            javax.sound.midi.Sequence seq = new javax.sound.midi.Sequence(javax.sound.midi.Sequence.PPQ, 4);
+            javax.sound.midi.Track track = seq.createTrack();
+
+            // simple C major progression, one chord per bar
+            int[] chords = {60, 64, 67}; // C E G
+            for (int bar = 0; bar < 8; bar++) {
+                int tick = bar * 16;
+                for (int n : chords) {
+                    track.add(makeNoteEvent(144, n, 100, tick)); // note on
+                    track.add(makeNoteEvent(128, n, 0, tick + 12)); // note off
+                    tick += 4;
+                }
+            }
+            // configure sequencer with our sequence and looping
+            sequencer.setSequence(seq);
+            sequencer.setLoopCount(javax.sound.midi.Sequencer.LOOP_CONTINUOUSLY);
+            sequencer.start();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void stopBackgroundMusic() {
+        if (sequencer != null) {
+            sequencer.stop();
+            sequencer.close();
+        }
+    }
+
+    private javax.sound.midi.MidiEvent makeNoteEvent(int command, int pitch, int velocity, int tick) throws javax.sound.midi.InvalidMidiDataException {
+        javax.sound.midi.ShortMessage message = new javax.sound.midi.ShortMessage();
+        message.setMessage(command, 0, pitch, velocity);
+        return new javax.sound.midi.MidiEvent(message, tick);
+    }
+
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            new TicTacToeUI().setVisible(true);
+        });
+    }
+}
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.SourceDataLine;
+import javax.sound.midi.*;
+
+public class TicTacToeUI extends JFrame {
+    private TicTacToe game;
+    private AnimatedButton[][] buttons;
+    private JLabel statusLabel;
+    private JPanel boardPanel;          // keep reference for background animation
+    private boolean vsComputer = false; // toggle for AI opponent
+    private Timer bgTimer;
+
+    // MIDI sequencer for background music
+    private javax.sound.midi.Sequencer sequencer;
+
+    // helper method to synthesize a tone (simple sine wave) of given frequency/duration
+    private static void playTone(final int hz, final int msecs) {
+        new Thread(() -> {
+            try {
+                float SAMPLE_RATE = 44100;
+                byte[] buf = new byte[1];
+                AudioFormat af = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                SourceDataLine sdl = AudioSystem.getSourceDataLine(af);
+                sdl.open(af);
+                sdl.start();
+
+                int totalSamples = msecs * (int)SAMPLE_RATE / 1000;
+                double durationSec = msecs / 1000.0;
+                // make attack/release a bit longer and use cosine ramps for smoothness
+                double attackSec = Math.min(0.05, durationSec * 0.2);   // up to 50ms or 20%
+                double releaseSec = Math.min(0.1, durationSec * 0.3);   // up to 100ms or 30%
+
+                for (int i = 0; i < totalSamples; i++) {
+                    double t = i / SAMPLE_RATE;
+                    double angle = t * hz * 2.0 * Math.PI;
+
+                    // base exponential decay to keep tone from ringing forever
+                    double envelope = Math.exp(-3.0 * t / durationSec);
+
+                    // smooth cosine attack
+                    if (t < attackSec) {
+                        double x = t / attackSec;
+                        envelope *= 0.5 * (1 - Math.cos(Math.PI * x));
+                    }
+                    // smooth cosine release
+                    if (t > durationSec - releaseSec) {
+                        double x = (durationSec - t) / releaseSec;
+                        envelope *= 0.5 * (1 - Math.cos(Math.PI * x));
+                    }
+
+                    buf[0] = (byte) (Math.sin(angle) * 127 * envelope);
+                    sdl.write(buf, 0, 1);
+                }
+                sdl.drain();
+                sdl.stop();
+                sdl.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    // rich effects for move, win, draw
+    private void playMoveSound() {
+        playTone(440, 150);
+    }
+    private void playWinSound() {
+        playTone(880, 150);
+        playTone(1000, 150);
+    }
+    private void playDrawSound() {
+        playTone(330, 150);
+        playTone(250, 150);
+    }
+
+    // piano-style note with simple harmonic content and ADSR envelope
+    private static void playPianoNote(final int hz, final int msecs) {
+        new Thread(() -> {
+            try {
+                float SAMPLE_RATE = 44100;
+                byte[] buf = new byte[1];
+                AudioFormat af = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                SourceDataLine sdl = AudioSystem.getSourceDataLine(af);
+                sdl.open(af);
+                sdl.start();
+
+                int total = msecs * (int)SAMPLE_RATE / 1000;
+                double duration = msecs / 1000.0;
+                // ADSR parameters
+                double attack = Math.min(0.02, duration * 0.1);
+                double decay = Math.min(0.05, duration * 0.2);
+                double sustainLevel = 0.6;
+                double release = Math.min(0.1, duration * 0.3);
+
+                for (int i = 0; i < total; i++) {
+                    double t = i / SAMPLE_RATE;
+                    double angle = t * hz * 2.0 * Math.PI;
+                    // add a bit of second harmonic for timbre
+                    double signal = Math.sin(angle) + 0.5 * Math.sin(2 * angle);
+
+                    // envelope
+                    double env;
+                    if (t < attack) {
+                        env = (t / attack);
+                    } else if (t < attack + decay) {
+                        env = 1 - (1 - sustainLevel) * ((t - attack) / decay);
+                    } else if (t < duration - release) {
+                        env = sustainLevel;
+                    } else {
+                        env = sustainLevel * ((duration - t) / release);
+                    }
+
+                    buf[0] = (byte) (signal * 127 * env);
+                    sdl.write(buf, 0, 1);
+                }
+                sdl.drain();
+                sdl.stop();
+                sdl.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    public TicTacToeUI() {
+        initUI();
+    }
+
+    // lightweight subclass that can fade in symbols and flash when highlighting
+    private class AnimatedButton extends JButton {
+        private char symbol = '\0';
+        private float alpha = 0f;
+        private float scale = 1f;
+        private float angle = 0f;            // for rotation
+        private Timer fadeTimer;
+        private Timer highlightTimer;
+        private Timer spinTimer;
+        private Color defaultBg;
+        private boolean flashing;
+
+        AnimatedButton() {
+            super(" ");
+            setFont(new Font(Font.SANS_SERIF, Font.BOLD, 60));
+            defaultBg = getBackground();
+        }
+
+        void animateSymbol(char c) {
+            symbol = c;
+            alpha = 0f;
+            scale = 0.5f;
+            angle = - (float)Math.PI / 2;  // start rotated
+            setText(" ");
+            // fade-in, scale-up and rotate simultaneously
+            fadeTimer = new Timer(30, e -> {
+                alpha += 0.1f;
+                scale += 0.05f;
+                angle += 0.1f;
+                if (alpha >= 1f) {
+                    alpha = 1f;
+                }
+                if (scale >= 1f) {
+                    scale = 1f;
+                }
+                if (angle >= 0f) {
+                    angle = 0f;
+                }
+                if (alpha == 1f && scale == 1f && angle == 0f) {
+                    fadeTimer.stop();
+                    setText(String.valueOf(symbol));
+                }
+                repaint();
+            });
+            fadeTimer.start();
+            playMoveSound();
+        }
+
+        void flash() {
+            if (highlightTimer != null && highlightTimer.isRunning()) return;
+            flashing = true;
+            highlightTimer = new Timer(300, new ActionListener() {
+                private boolean on = false;
+                private int count = 0;
+                public void actionPerformed(ActionEvent e) {
+                    on = !on;
+                    setBackground(on ? Color.YELLOW : defaultBg);
+                    if (++count >= 6) {
+                        highlightTimer.stop();
+                        setBackground(defaultBg);
+                        flashing = false;
+                    }
+                }
+            });
+            highlightTimer.start();
+        }
+
+        void spin() {
+            if (spinTimer != null && spinTimer.isRunning()) return;
+            spinTimer = new Timer(30, e -> {
+                angle += 0.3f;
+                if (angle > 2 * Math.PI) {
+                    angle -= 2 * Math.PI;
+                }
+                repaint();
+            });
+            spinTimer.setRepeats(false);
+            spinTimer.setInitialDelay(0);
+            spinTimer.start();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            if (symbol != '\0' && (alpha < 1f || scale < 1f || angle != 0f)) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+                g2.setFont(getFont());
+                FontMetrics fm = g2.getFontMetrics();
+                String s = String.valueOf(symbol);
+                int sw = fm.stringWidth(s);
+                int sh = fm.getAscent();
+                int x = (getWidth() - sw) / 2;
+                int y = (getHeight() + sh) / 2 - fm.getDescent();
+                // apply rotation and scaling around center
+                int cx = getWidth() / 2;
+                int cy = getHeight() / 2;
+                g2.rotate(angle, cx, cy);
+                g2.translate(cx, cy);
+                g2.scale(scale, scale);
+                g2.translate(-cx, -cy);
+                g2.drawString(s, x, y);
+                g2.dispose();
+            } else {
+                super.paintComponent(g);
+            }
+        }
+    }
+
+    private void initUI() {
+        // try Nimbus look and feel for a modern appearance
+        try {
+            for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels()) {
+                if ("Nimbus".equals(info.getName())) {
+                    UIManager.setLookAndFeel(info.getClassName());
+                    break;
+                }
+            }
+        } catch (Exception ignored) { }
+
+        game = new TicTacToe();
+
+        setTitle("Tic Tac Toe");
+        setLayout(new BorderLayout());
+
+        boardPanel = new JPanel(new GridLayout(3, 3));
+        buttons = new AnimatedButton[3][3];
+        startBackgroundAnimation();
+
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                AnimatedButton btn = new AnimatedButton();
+                final int row = i;
+                final int col = j;
+                btn.addActionListener(e -> handleMove(row, col));
+                buttons[i][j] = btn;
+                boardPanel.add(btn);
+            }
+        }
+
+        add(boardPanel, BorderLayout.CENTER);
+
+        statusLabel = new JLabel("Player X's turn");
+        statusLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        add(statusLabel, BorderLayout.SOUTH);
+
+        JMenuBar menuBar = new JMenuBar();
+        JMenu gameMenu = new JMenu("Game");
+        JMenuItem newItem = new JMenuItem("New");
+        newItem.addActionListener(e -> resetGame());
+        gameMenu.add(newItem);
+        JCheckBoxMenuItem aiToggle = new JCheckBoxMenuItem("Play vs Computer");
+        aiToggle.addActionListener(e -> vsComputer = aiToggle.isSelected());
+        gameMenu.add(aiToggle);
+        menuBar.add(gameMenu);
+        setJMenuBar(menuBar);
+
+        setSize(400, 400);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // ensure music stops when window closes
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                stopBackgroundMusic();
+            }
+        });
+        setLocationRelativeTo(null);
+    }
+
+    private void handleMove(int row, int col) {
+        if (game.isGameOver()) {
+            return;
+        }
+
+        if (!game.makeMove(row, col)) {
+            JOptionPane.showMessageDialog(this, "Invalid move! Try again.");
+            return;
+        }
+
+        buttons[row][col].animateSymbol(game.getBoard()[row][col]);
+
+        if (game.isGameOver()) {
+            statusLabel.setText("Player " + game.getCurrentPlayer() + " has won!");
+            playWinSound();
+            animateStatus();
+            // highlight winning line
+            int[][] line = game.getWinningLine();
+            if (line != null) {
+                for (int[] cell : line) {
+                    AnimatedButton btn = buttons[cell[0]][cell[1]];
+                    btn.flash();
+                    btn.spin();
+                }
+            }
+            int choice = JOptionPane.showOptionDialog(this,
+                    "Player " + game.getCurrentPlayer() + " wins!\nPlay again?",
+                    "Game Over",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    new Object[]{"Yes","No"},
+                    "Yes");
+            if (choice == JOptionPane.YES_OPTION) {
+                resetGame();
+            } else {
+                System.exit(0);
+            }
+        } else if (game.isBoardFull()) {
+            statusLabel.setText("Draw!");
+            playDrawSound();
+            animateStatus();
+            int choice = JOptionPane.showOptionDialog(this,
+                    "It's a draw!\nPlay again?",
+                    "Game Over",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    new Object[]{"Yes","No"},
+                    "Yes");
+            if (choice == JOptionPane.YES_OPTION) {
+                resetGame();
+            } else {
+                System.exit(0);
+            }
+        } else {
+            game.switchPlayer();
+            statusLabel.setText("Player " + game.getCurrentPlayer() + "'s turn");
+            animateStatus();
+            if (vsComputer && game.getCurrentPlayer() == 'O') {
+                computerMove();
+            }
+        }
+    }
+
+    private void animateStatus() {
+        // simple color flash on the label
+        final Color normal = statusLabel.getForeground();
+        Timer t = new Timer(100, new ActionListener() {
+            int count = 0;
+            boolean red = false;
+            public void actionPerformed(ActionEvent e) {
+                statusLabel.setForeground(red ? Color.RED : normal);
+                red = !red;
+                if (++count >= 6) {
+                    ((Timer)e.getSource()).stop();
+                    statusLabel.setForeground(normal);
+                }
+            }
+        });
+        t.start();
+    }
+
+    private void computerMove() {
+        int[] move = game.pickRandomMove();
+        if (move == null) return;
+        // small delay so user sees their mark first
+        Timer t = new Timer(400, e -> {
+            handleMove(move[0], move[1]);
+        });
+        t.setRepeats(false);
+        t.start();
+    }
+
+    private void startBackgroundAnimation() {
+        if (bgTimer != null) return; // already running
+        bgTimer = new Timer(200, new ActionListener() {
+            float hue = 0f;
+            public void actionPerformed(ActionEvent e) {
+                hue += 0.02f;
+                if (hue > 1f) hue = 0f;
+                boardPanel.setBackground(Color.getHSBColor(hue, 0.2f, 1f));
+            }
+        });
+        bgTimer.start();
+        startBackgroundMusic();
+    }
+
+    private void resetGame() {
+        game.reset();
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                buttons[i][j].setText(" ");
+            }
+        }
+        statusLabel.setText("Player " + game.getCurrentPlayer() + "'s turn");
+        if (vsComputer && game.getCurrentPlayer() == 'O') {
+            computerMove();
+        }
+    }
+
+    // start looping MIDI piano background using built-in synthesizer
+    private void startBackgroundMusic() {
+        if (sequencer != null && sequencer.isOpen()) return;
+        try {
+            sequencer = javax.sound.midi.MidiSystem.getSequencer();
+            sequencer.open();
+            javax.sound.midi.Sequence seq = new javax.sound.midi.Sequence(javax.sound.midi.Sequence.PPQ, 4);
+            javax.sound.midi.Track track = seq.createTrack();
+
+            // simple C major progression, one chord per bar
+            int[] chords = {60, 64, 67}; // C E G
+            for (int bar = 0; bar < 8; bar++) {
+                int tick = bar * 16;
+                for (int n : chords) {
+                    track.add(makeNoteEvent(144, n, 100, tick)); // note on
+                    track.add(makeNoteEvent(128, n, 0, tick + 12)); // note off
+                    tick += 4;
+                }
+            }
+            // configure sequencer with our sequence and looping
+            sequencer.setSequence(seq);
+            sequencer.setLoopCount(javax.sound.midi.Sequencer.LOOP_CONTINUOUSLY);
+            sequencer.start();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void stopBackgroundMusic() {
+        if (sequencer != null) {
+            sequencer.stop();
+            sequencer.close();
+        }
+    }
+
+    private javax.sound.midi.MidiEvent makeNoteEvent(int command, int pitch, int velocity, int tick) throws javax.sound.midi.InvalidMidiDataException {
+        javax.sound.midi.ShortMessage message = new javax.sound.midi.ShortMessage();
+        message.setMessage(command, 0, pitch, velocity);
+        return new javax.sound.midi.MidiEvent(message, tick);
+    }
+
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            new TicTacToeUI().setVisible(true);
+        });
+    }
+}
